@@ -30,14 +30,14 @@ def clean_number(raw: str):
     if raw is None:
         return None
     raw = raw.strip()
+    raw = raw.replace(",", "")
     raw = re.sub(r"[^\d.]", "", raw)
-    if raw == "" or raw == ".":
+    if raw in ("", "."):
         return None
     try:
         return round(float(raw), 2)
-    except ValueError:
+    except:
         return None
-
 
 def parse_date(raw: str):
     if not raw:
@@ -145,20 +145,28 @@ def extract_vendor(text: str):
 
 def extract_amount(text: str):
     patterns = [
-        r"(?:sub\s*-?\s*total)\s*[\s.\-:]*\s*(?:Rs\.?|INR|₹|\$|USD|€|£)?\s*([\d,]+\.?\d*)",
-        r"(?:net\s*amount|amount\s*before\s*tax)\s*[\s.\-:]*\s*(?:Rs\.?|INR|₹|\$|USD|€|£)?\s*([\d,]+\.?\d*)",
+        r"(?:Sub\s*Total|Subtotal)\s*[:\-]?\s*(?:Rs\.?|INR|₹|\$|USD|EUR|€|GBP|£)?\s*([\d,]+(?:\.\d+)?)",
+        r"(?:Amount\s*Before\s*Tax)\s*[:\-]?\s*(?:Rs\.?|INR|₹|\$|USD|EUR|€|GBP|£)?\s*([\d,]+(?:\.\d+)?)",
+        r"(?:Net\s*Amount)\s*[:\-]?\s*(?:Rs\.?|INR|₹|\$|USD|EUR|€|GBP|£)?\s*([\d,]+(?:\.\d+)?)",
     ]
-    raw = find_first(text, patterns)
-    return clean_number(raw)
-
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            return clean_number(m.group(1))
+    return None
 
 def extract_tax(text: str):
     patterns = [
-        r"(?:GST|IGST|CGST|SGST|VAT|tax)\s*(?:\(\s*\d+\.?\d*\s*%\s*\))?\s*[\s.\-:]*\s*(?:Rs\.?|INR|₹|\$|USD|€|£)?\s*([\d,]+\.?\d*)",
+        r"(?:GST|IGST|CGST|SGST|VAT|Tax)\s*\(\s*\d+(?:\.\d+)?%\s*\)\s*(?:Rs\.?|INR|₹|\$|USD|EUR|€|GBP|£)?\s*([\d,]+(?:\.\d+)?)",
+        r"(?:GST|IGST|CGST|SGST|VAT|Tax)\s*[:\-]\s*(?:Rs\.?|INR|₹|\$|USD|EUR|€|GBP|£)?\s*([\d,]+(?:\.\d+)?)",
+        r"Tax\s*Amount\s*[:\-]?\s*(?:Rs\.?|INR|₹|\$|USD|EUR|€|GBP|£)?\s*([\d,]+(?:\.\d+)?)",
+        r"GST\s*Amount\s*[:\-]?\s*(?:Rs\.?|INR|₹|\$|USD|EUR|€|GBP|£)?\s*([\d,]+(?:\.\d+)?)",
     ]
-    raw = find_first(text, patterns)
-    return clean_number(raw)
-
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            return clean_number(m.group(1))
+    return None
 
 def extract_currency(text: str):
     patterns = [
