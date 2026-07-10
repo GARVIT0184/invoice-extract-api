@@ -95,10 +95,19 @@ def find_first(text: str, patterns):
 
 def extract_invoice_no(text: str):
     patterns = [
-        r"(?:invoice\s*(?:no\.?|number|#)|inv\s*no\.?|ref(?:erence)?(?:\s*no\.?)?)\s*[:\-]\s*([A-Za-z0-9/\-_.]+)",
-        r"(?:bill\s*no\.?)\s*[:\-]\s*([A-Za-z0-9/\-_.]+)",
+        r"(?:invoice|inv)\s*(?:no\.?|number|num|id|#)\s*[:#\-]?\s*([A-Za-z0-9][A-Za-z0-9/\-_.]{2,})",
+        r"(?:invoice|inv)\s*[:#\-]\s*([A-Za-z0-9][A-Za-z0-9/\-_.]{2,})",
+        r"ref(?:erence)?\s*(?:no\.?|number|#)?\s*[:#\-]?\s*([A-Za-z0-9][A-Za-z0-9/\-_.]{2,})",
+        r"(?:bill|doc(?:ument)?|receipt|order|transaction|txn)\s*(?:no\.?|number|id|#)\s*[:#\-]?\s*([A-Za-z0-9][A-Za-z0-9/\-_.]{2,})",
     ]
-    return find_first(text, patterns)
+    result = find_first(text, patterns)
+    if result:
+        return result.strip().rstrip(".,")
+
+    m = re.search(r"\b([A-Z]{1,6}[-/][A-Za-z0-9\-/]{2,10})\b", text)
+    if m:
+        return m.group(1)
+    return None
 
 
 def extract_date(text: str):
