@@ -12,9 +12,9 @@ log = logging.getLogger("invoice-api")
 
 app = FastAPI()
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
-MODEL = "claude-sonnet-4-5-20250929"  # change if you want a different model
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+MODEL = "gemini-2.0-flash"  # change if you want a different Gemini model
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
 
 CURRENCY_MAP = {
     "usd": "USD", "dollar": "USD", "dollars": "USD", "$": "USD", "us dollar": "USD", "us dollars": "USD",
@@ -204,8 +204,35 @@ def normalize_date(raw: str):
     return None
 
 
+def sanitize_schema_for_gemini(schema):
+    """Gemini's responseSchema only supports a subset of OpenAPI/JSON-Schema keywords.
+    Recursively strip unsupported keys and uppercase 'type' values."""
+    if not isinstance(schema, dict):
+        return schema
+
+    UNSUPPORTED_KEYS = {"additionalProperties", "$schema", "title", "examples", "default", "const"}
+    TYPE_MAP = {
+        "object": "OBJECT", "string": "STRING", "number": "NUMBER",
+        "integer": "INTEGER", "boolean": "BOOLEAN", "array": "ARRAY",
+    }
+
+    out = {}
+    for key, value in schema.items():
+        if key in UNSUPPORTED_KEYS:
+            continue
+        if key == "type" and isinstance(value, str):
+            out[key] = TYPE_MAP.get(value.lower(), value.upper())
+        elif key == "properties" and isinstance(value, dict):
+            out[key] = {k: sanitize_schema_for_gemini(v) for k, v in value.items()}
+        elif key == "items":
+            out[key] = sanitize_schema_for_gemini(value)
+        else:
+            out[key] = value
+    return out
+
+
 async def call_llm(document_text: str, schema: dict):
-    system_prompt = """You are an invoice data extraction engine. Extract structured data from the invoice text EXACTLY per the JSON schema tool provided. Follow these rules precisely:
+    system_prompt = """You are an invoice data extraction engine. Extract structured data from the invoice text EXACTLY per the JSON schema provided. Follow these rules precisely:
 
 - vendor: the biller's proper name, exactly as written in the text.
 - currency: ISO 4217 code (USD, EUR, GBP, INR, JPY, etc), inferred from symbols or words like "euros", "pounds sterling", "₹".
@@ -218,40 +245,35 @@ async def call_llm(document_text: str, schema: dict):
 - line_items: array of {sku, quantity, unit_price} objects in the order they appear in the text. unit_price is an integer.
 - item_count: number of line items.
 
-Return your answer ONLY by calling the `extract_invoice` tool with an object matching the schema exactly - no extra keys, no missing keys."""
+Return ONLY the JSON object matching the schema exactly - no extra keys, no missing keys, no markdown fences."""
 
-    tool = {
-        "name": "extract_invoice",
-        "description": "Return the extracted invoice data matching the schema exactly.",
-        "input_schema": schema,
-    }
+    gemini_schema = sanitize_schema_for_gemini(schema)
 
     payload = {
-        "model": MODEL,
-        "max_tokens": 2000,
-        "system": system_prompt,
-        "messages": [
-            {"role": "user", "content": f"Invoice text:\n\n{document_text}"}
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [
+            {"role": "user", "parts": [{"text": f"Invoice text:\n\n{document_text}"}]}
         ],
-        "tools": [tool],
-        "tool_choice": {"type": "tool", "name": "extract_invoice"},
-    }
-
-    headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": gemini_schema,
+        },
     }
 
     async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(ANTHROPIC_URL, headers=headers, json=payload)
+        resp = await client.post(
+            GEMINI_URL,
+            params={"key": GEMINI_API_KEY},
+            json=payload,
+        )
         resp.raise_for_status()
         data = resp.json()
 
-    for block in data.get("content", []):
-        if block.get("type") == "tool_use":
-            return block.get("input", {})
-    raise ValueError("No tool_use block found in LLM response")
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text)
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        raise ValueError(f"Could not parse Gemini response: {e} | raw={data}")
 
 
 def postprocess(extracted: dict, text: str, schema: dict) -> dict:
