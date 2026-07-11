@@ -13,8 +13,18 @@ log = logging.getLogger("invoice-api")
 app = FastAPI()
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-MODEL = "gemini-2.0-flash"  # change if you want a different Gemini model
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+# Try these in order - each Gemini model has its own separate free-tier quota bucket,
+# so if one is exhausted we fall through to the next.
+MODEL_FALLBACKS = [
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+]
+
+
+def gemini_url(model: str) -> str:
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 CURRENCY_MAP = {
     "usd": "USD", "dollar": "USD", "dollars": "USD", "$": "USD", "us dollar": "USD", "us dollars": "USD",
@@ -262,40 +272,52 @@ Return ONLY the JSON object matching the schema exactly - no extra keys, no miss
 
     import asyncio
 
-    max_attempts = 6
-    backoff = 2.0
+    max_attempts_per_model = 3
+    backoff_start = 2.0
     last_error = None
 
     async with httpx.AsyncClient(timeout=60.0) as client:
-        for attempt in range(max_attempts):
-            resp = await client.post(
-                GEMINI_URL,
-                params={"key": GEMINI_API_KEY},
-                json=payload,
-            )
-            if resp.status_code == 429 or resp.status_code >= 500:
-                last_error = f"{resp.status_code} {resp.text[:300]}"
-                if attempt < max_attempts - 1:
-                    # Respect Retry-After if Gemini sends one, else exponential backoff
-                    retry_after = resp.headers.get("retry-after")
-                    wait = float(retry_after) if retry_after else backoff
-                    log.warning("Gemini %s, retrying in %.1fs (attempt %d/%d)",
-                                resp.status_code, wait, attempt + 1, max_attempts)
-                    await asyncio.sleep(wait)
-                    backoff *= 2
-                    continue
-                resp.raise_for_status()
-            resp.raise_for_status()
-            data = resp.json()
-            break
-        else:
-            raise ValueError(f"Gemini rate-limited after {max_attempts} attempts: {last_error}")
+        for model in MODEL_FALLBACKS:
+            url = gemini_url(model)
+            backoff = backoff_start
+            for attempt in range(max_attempts_per_model):
+                resp = await client.post(url, params={"key": GEMINI_API_KEY}, json=payload)
 
-    try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(text)
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
-        raise ValueError(f"Could not parse Gemini response: {e} | raw={data}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    try:
+                        text = data["candidates"][0]["content"]["parts"][0]["text"]
+                        return json.loads(text)
+                    except (KeyError, IndexError, json.JSONDecodeError) as e:
+                        last_error = f"parse error on {model}: {e} | raw={data}"
+                        break  # try next model
+
+                last_error = f"{model} -> {resp.status_code} {resp.text[:300]}"
+
+                if resp.status_code == 429:
+                    body_lower = resp.text.lower()
+                    if "perday" in body_lower or "per day" in body_lower or "daily" in body_lower:
+                        log.warning("Gemini %s daily quota exhausted, switching model", model)
+                        break  # no point retrying same model, move to next
+                    if attempt < max_attempts_per_model - 1:
+                        log.warning("Gemini %s 429, retrying in %.1fs (attempt %d/%d)",
+                                    model, backoff, attempt + 1, max_attempts_per_model)
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    log.warning("Gemini %s still 429 after retries, switching model", model)
+                    break
+                elif resp.status_code >= 500:
+                    if attempt < max_attempts_per_model - 1:
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    break
+                else:
+                    # Non-retryable error (400, 403, etc) - move to next model
+                    break
+
+    raise ValueError(f"All Gemini model fallbacks failed. Last error: {last_error}")
 
 
 def postprocess(extracted: dict, text: str, schema: dict) -> dict:
