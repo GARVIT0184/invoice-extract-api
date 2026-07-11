@@ -1,347 +1,365 @@
+import os
 import re
-from datetime import datetime
+import json
+import logging
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+import httpx
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("invoice-api")
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+MODEL = "claude-sonnet-4-5-20250929"  # change if you want a different model
 
-MONTHS = {
-    "jan": 1,
-    "january": 1,
-    "feb": 2,
-    "february": 2,
-    "mar": 3,
-    "march": 3,
-    "apr": 4,
-    "april": 4,
-    "may": 5,
-    "jun": 6,
-    "june": 6,
-    "jul": 7,
-    "july": 7,
-    "aug": 8,
-    "august": 8,
-    "sep": 9,
-    "sept": 9,
-    "september": 9,
-    "oct": 10,
-    "october": 10,
-    "nov": 11,
-    "november": 11,
-    "dec": 12,
-    "december": 12,
+CURRENCY_MAP = {
+    "usd": "USD", "dollar": "USD", "dollars": "USD", "$": "USD", "us dollar": "USD", "us dollars": "USD",
+    "eur": "EUR", "euro": "EUR", "euros": "EUR", "€": "EUR",
+    "gbp": "GBP", "pound": "GBP", "pounds": "GBP", "pound sterling": "GBP", "pounds sterling": "GBP", "£": "GBP",
+    "inr": "INR", "rupee": "INR", "rupees": "INR", "₹": "INR", "rs": "INR", "rs.": "INR",
+    "jpy": "JPY", "yen": "JPY", "¥": "JPY",
 }
 
+WORD_NUMS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+    "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+SCALES = {"hundred": 100, "thousand": 1000, "lakh": 100000, "lac": 100000, "million": 1000000, "crore": 10000000}
 
-class ExtractRequest(BaseModel):
-    invoice_text: str
+
+def words_to_number(text: str):
+    """Convert a spelled-out number phrase (with optional scale words) to an int."""
+    text = text.lower().replace("-", " ")
+    text = re.sub(r"\band\b", " ", text)
+    tokens = [t for t in re.split(r"[\s,]+", text) if t]
+    total = 0
+    current = 0
+    found = False
+    for tok in tokens:
+        if tok in WORD_NUMS:
+            current += WORD_NUMS[tok]
+            found = True
+        elif tok in SCALES:
+            scale = SCALES[tok]
+            if scale >= 1000:
+                total += (current if current else 1) * scale
+                current = 0
+            else:
+                current = (current if current else 1) * scale
+            found = True
+    total += current
+    return total if found else None
 
 
-def clean_number(raw):
+def parse_amount(raw: str):
+    """Parse an amount string that may use words, K/M suffix, or grouped digits (Indian/Western) into an int."""
     if raw is None:
         return None
+    s = str(raw).strip()
 
-    raw = raw.strip()
+    # Strip currency symbols/words
+    s_clean = re.sub(r"[₹$€£]", "", s)
+    s_clean = re.sub(
+        r"\b(usd|eur|gbp|inr|jpy|rs\.?|rupees?|dollars?|euros?|pounds?( sterling)?|yen)\b",
+        "", s_clean, flags=re.IGNORECASE
+    ).strip()
 
-    raw = raw.replace(",", "")
+    # K/M suffix e.g. 12K, 1.5M
+    m = re.fullmatch(r"([\d,.]+)\s*([kKmM])", s_clean)
+    if m:
+        num = float(m.group(1).replace(",", ""))
+        mult = 1000 if m.group(2).lower() == "k" else 1_000_000
+        return int(round(num * mult))
 
-    raw = re.sub(r"[^\d.]", "", raw)
-
-    if raw in ("", "."):
-        return None
-
-    try:
-        return round(float(raw), 2)
-    except:
-        return None
-
-
-def parse_date(raw):
-
-    if not raw:
-        return None
-
-    raw = raw.strip()
-
-    formats = [
-        "%Y-%m-%d",
-        "%d-%m-%Y",
-        "%d/%m/%Y",
-        "%d %B %Y",
-        "%B %d %Y",
-        "%B %d, %Y",
-    ]
-
-    for fmt in formats:
+    # Plain/grouped digits (strip all commas, works for both Western 12,480 and Indian 1,24,800 grouping)
+    digits_only = re.sub(r"[^\d.]", "", s_clean)
+    if digits_only and re.fullmatch(r"\d+(\.\d+)?", digits_only) and any(c.isdigit() for c in s_clean):
         try:
-            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
-        except:
+            return int(round(float(digits_only)))
+        except ValueError:
             pass
 
-    m = re.match(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", raw)
+    # Spelled out in words
+    w = words_to_number(s_clean)
+    if w is not None:
+        return w
 
+    return None
+
+
+def find_total_amount(text: str):
+    # Look near "total", "amount due", "grand total", "balance due"
+    patterns = [
+        r"(?:total amount|grand total|amount due|balance due|total)\s*[:\-]?\s*(?:is|of)?\s*([₹$€£]?\s?[\d,]+(?:\.\d+)?\s*[kKmM]?)",
+    ]
+    for p in patterns:
+        m = re.search(p, text, flags=re.IGNORECASE)
+        if m:
+            val = parse_amount(m.group(1))
+            if val is not None:
+                return val
+
+    # Word-based total, e.g. "total of twelve thousand four hundred eighty"
+    m = re.search(
+        r"(?:total|amount due|balance due)[^.\n]{0,20}?\b((?:[a-zA-Z]+[\s-]+){1,8}(?:hundred|thousand|lakh|crore|million)?[a-zA-Z\s-]*)",
+        text, flags=re.IGNORECASE
+    )
     if m:
-        d = int(m.group(1))
-        mon = MONTHS.get(m.group(2).lower())
-        y = int(m.group(3))
-
-        if mon:
-            try:
-                return datetime(y, mon, d).strftime("%Y-%m-%d")
-            except:
-                pass
+        val = words_to_number(m.group(1))
+        if val is not None:
+            return val
 
     return None
 
 
-def find_first(text, patterns):
-
-    for p in patterns:
-
-        m = re.search(p, text, re.I | re.M | re.S)
-
-        if m:
-
-            value = m.group(1).strip()
-
-            if value:
-
-                return value
-
+def find_currency(text: str):
+    for sym, code in {"₹": "INR", "$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY"}.items():
+        if sym in text:
+            return code
+    lowered = text.lower()
+    for word, code in CURRENCY_MAP.items():
+        if len(word) > 1 and re.search(r"\b" + re.escape(word) + r"\b", lowered):
+            return code
     return None
-def extract_invoice_no(text):
 
-    patterns = [
 
-        r"(?:invoice|inv)\s*(?:no|number|#|id)?\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9/_\-.]{2,})",
-
-        r"invoice\s*#\s*([A-Za-z0-9/_\-.]+)",
-
-        r"inv[-\s:]?([A-Za-z0-9/_\-.]+)",
-
-        r"reference\s*(?:no)?\s*[:#-]?\s*([A-Za-z0-9/_\-.]+)",
-
-        r"bill\s*(?:no)?\s*[:#-]?\s*([A-Za-z0-9/_\-.]+)",
-
-    ]
-
-    result = find_first(text, patterns)
-
-    if result:
-        return result.rstrip("., ")
-
-    m = re.search(r"\b[A-Z]{2,6}-\d{2,10}\b", text)
-
+def find_due_in_days(text: str):
+    m = re.search(r"\bnet\s+(\d+)\b", text, flags=re.IGNORECASE)
     if m:
-        return m.group(0)
-
+        return int(m.group(1))
+    m = re.search(r"(?:payable|due)\s+within\s+(\d+)\s+days?", text, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"due in (\d+)\s+days?", text, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"due in ([a-zA-Z\s-]+?)\s+weeks?", text, flags=re.IGNORECASE)
+    if m:
+        n = words_to_number(m.group(1)) or (1 if m.group(1).strip().lower() == "a" else None)
+        if n is not None:
+            return n * 7
+    m = re.search(r"due in ([a-zA-Z\s-]+?)\s+days?", text, flags=re.IGNORECASE)
+    if m:
+        n = words_to_number(m.group(1))
+        if n is not None:
+            return n
     return None
 
 
-def extract_date(text):
-
-    patterns = [
-
-        r"(?:invoice\s*date|date|dated|issued\s*on)\s*[:\-]?\s*([^\n]+)",
-
-        r"Date\s+([^\n]+)",
-
-    ]
-
-    raw = find_first(text, patterns)
-
-    if raw:
-
-        return parse_date(raw)
-
+def find_contact_email(text: str):
+    m = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text)
+    if m:
+        return m.group(0).lower()
     return None
 
 
-def extract_vendor(text):
+def find_is_paid(text: str):
+    lowered = text.lower()
+    paid_signals = ["paid in full", "payment received", "already paid", "paid on"]
+    unpaid_signals = ["awaiting payment", "unpaid", "outstanding", "pending payment", "not yet paid", "due upon"]
+    for s in unpaid_signals:
+        if s in lowered:
+            return False
+    for s in paid_signals:
+        if s in lowered:
+            return True
+    return None
 
-    patterns = [
 
-        r"(?:vendor|supplier|seller|bill\s*from|from)\s*[:\-]?\s*([^\n]+)",
+def find_priority(text: str):
+    lowered = text.lower()
+    if "urgent" in lowered:
+        return "urgent"
+    if "high priority" in lowered or re.search(r"\bhigh\b", lowered):
+        return "high"
+    if "low priority" in lowered or re.search(r"\blow\b", lowered):
+        return "low"
+    if "normal" in lowered:
+        return "normal"
+    return None
 
+
+def normalize_date(raw: str):
+    if not raw:
+        return None
+    raw = raw.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        return raw
+    from datetime import datetime
+    fmts = [
+        "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y", "%m/%d/%Y", "%d/%m/%Y",
+        "%Y/%m/%d", "%B %d %Y", "%d-%m-%Y", "%m-%d-%Y",
     ]
-
-    vendor = find_first(text, patterns)
-
-    if vendor:
-
-        return vendor.strip()
-
-    lines = [x.strip() for x in text.split("\n") if x.strip()]
-
-    for line in lines[:5]:
-
-        if "invoice" in line.lower():
-
+    for f in fmts:
+        try:
+            return datetime.strptime(raw, f).strftime("%Y-%m-%d")
+        except ValueError:
             continue
-
-        if re.search(r"\d", line):
-
-            continue
-
-        if len(line) > 3:
-
-            return line
-
     return None
 
 
-def extract_amount(text):
+async def call_llm(document_text: str, schema: dict):
+    system_prompt = """You are an invoice data extraction engine. Extract structured data from the invoice text EXACTLY per the JSON schema tool provided. Follow these rules precisely:
 
-    patterns = [
+- vendor: the biller's proper name, exactly as written in the text.
+- currency: ISO 4217 code (USD, EUR, GBP, INR, JPY, etc), inferred from symbols or words like "euros", "pounds sterling", "₹".
+- total_amount: integer in the main unit, no separators or symbols. Text may spell it out ("twelve thousand four hundred eighty"), use grouped digits (12,480 or Indian grouping 1,24,800), or a K/M suffix (12K = 12000).
+- invoice_date: normalize to YYYY-MM-DD.
+- due_in_days: integer parsed from phrases like "Net 30", "payable within 45 days", "due in two weeks" (=14).
+- is_paid: boolean inferred from wording ("paid in full" = true, "awaiting payment" = false).
+- priority: one of low, normal, high, urgent.
+- contact_email: lowercased.
+- line_items: array of {sku, quantity, unit_price} objects in the order they appear in the text. unit_price is an integer.
+- item_count: number of line items.
 
-        r"(?:sub\s*total|subtotal)\s*[:\-]?\s*(?:Rs\.?|INR|₹|\$|USD|EUR|€|GBP|£)?\s*([\d,]+(?:\.\d+)?)",
+Return your answer ONLY by calling the `extract_invoice` tool with an object matching the schema exactly - no extra keys, no missing keys."""
 
-        r"(?:amount\s*before\s*tax)\s*[:\-]?\s*(?:Rs\.?|INR|₹|\$|USD|EUR|€|GBP|£)?\s*([\d,]+(?:\.\d+)?)",
+    tool = {
+        "name": "extract_invoice",
+        "description": "Return the extracted invoice data matching the schema exactly.",
+        "input_schema": schema,
+    }
 
-        r"(?:net\s*amount)\s*[:\-]?\s*(?:Rs\.?|INR|₹|\$|USD|EUR|€|GBP|£)?\s*([\d,]+(?:\.\d+)?)",
+    payload = {
+        "model": MODEL,
+        "max_tokens": 2000,
+        "system": system_prompt,
+        "messages": [
+            {"role": "user", "content": f"Invoice text:\n\n{document_text}"}
+        ],
+        "tools": [tool],
+        "tool_choice": {"type": "tool", "name": "extract_invoice"},
+    }
 
-    ]
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
 
-    for p in patterns:
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(ANTHROPIC_URL, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
 
-        m = re.search(p, text, re.I)
-
-        if m:
-
-            return clean_number(m.group(1))
-
-    return None
-
-
-def extract_tax(text):
-
-    patterns = [
-
-        # GST (18%) 1728
-        r"(?:GST|IGST|CGST|SGST|VAT|Tax).*?\(\s*\d+(?:\.\d+)?%\s*\).*?(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d+)?)",
-
-        # GST @18% 1728
-        r"(?:GST|IGST|CGST|SGST|VAT|Tax).*?@\s*\d+(?:\.\d+)?%\s*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d+)?)",
-
-        # GST 18% 1728
-        r"(?:GST|IGST|CGST|SGST|VAT|Tax).*?\d+(?:\.\d+)?%\s*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d+)?)",
-
-        # GST : 1728
-        r"(?:GST|IGST|CGST|SGST|VAT|Tax)\s*[:\-]?\s*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d+)?)",
-
-        # Tax Amount
-        r"Tax\s*Amount\s*[:\-]?\s*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d+)?)",
-
-        # GST Amount
-        r"GST\s*Amount\s*[:\-]?\s*(?:Rs\.?|INR|₹)?\s*([\d,]+(?:\.\d+)?)",
-
-    ]
-
-    for p in patterns:
-
-        m = re.search(p, text, re.I | re.S)
-
-        if m:
-
-            return clean_number(m.group(1))
-
-    return None
-
-def extract_currency(text):
-
-    patterns = [
-        r"currency\s*[:\-]?\s*([A-Za-z]{3})",
-    ]
-
-    cur = find_first(text, patterns)
-
-    if cur:
-        return cur.upper()
-
-    if re.search(r"₹|Rs\.?|INR", text, re.I):
-        return "INR"
-
-    if re.search(r"\$|USD", text, re.I):
-        return "USD"
-
-    if re.search(r"€|EUR", text, re.I):
-        return "EUR"
-
-    if re.search(r"£|GBP", text, re.I):
-        return "GBP"
-
-    return None
+    for block in data.get("content", []):
+        if block.get("type") == "tool_use":
+            return block.get("input", {})
+    raise ValueError("No tool_use block found in LLM response")
 
 
-def extract_total(text):
+def postprocess(extracted: dict, text: str, schema: dict) -> dict:
+    """Normalize fields and fill in gaps using regex fallbacks, then trim to exact schema keys."""
+    result = dict(extracted) if isinstance(extracted, dict) else {}
 
-    patterns = [
+    # total_amount
+    ta = result.get("total_amount")
+    parsed = parse_amount(ta) if ta is not None else None
+    if parsed is None:
+        parsed = find_total_amount(text)
+    if parsed is not None:
+        result["total_amount"] = int(parsed)
 
-        r"(?:Grand\s*Total|Invoice\s*Total|Total\s*Amount|Total)\s*[:\-]?\s*(?:Rs\.?|INR|₹|\$|USD|EUR|€|GBP|£)?\s*([\d,]+(?:\.\d+)?)",
+    # currency
+    cur = result.get("currency")
+    if not cur or not re.fullmatch(r"[A-Z]{3}", str(cur)):
+        fallback = find_currency(text)
+        if fallback:
+            result["currency"] = fallback
+    elif cur:
+        result["currency"] = cur.upper()
 
-    ]
+    # invoice_date
+    date_val = normalize_date(result.get("invoice_date"))
+    if date_val:
+        result["invoice_date"] = date_val
 
-    for p in patterns:
+    # due_in_days
+    if result.get("due_in_days") is None:
+        d = find_due_in_days(text)
+        if d is not None:
+            result["due_in_days"] = d
+    if isinstance(result.get("due_in_days"), str):
+        try:
+            result["due_in_days"] = int(result["due_in_days"])
+        except ValueError:
+            pass
 
-        m = re.search(p, text, re.I)
+    # is_paid
+    if result.get("is_paid") is None:
+        ip = find_is_paid(text)
+        if ip is not None:
+            result["is_paid"] = ip
 
-        if m:
-            return clean_number(m.group(1))
+    # priority
+    pr = result.get("priority")
+    if not pr or pr.lower() not in {"low", "normal", "high", "urgent"}:
+        fallback = find_priority(text)
+        if fallback:
+            result["priority"] = fallback
+    else:
+        result["priority"] = pr.lower()
 
-    return None
+    # contact_email
+    email = result.get("contact_email")
+    if email:
+        result["contact_email"] = email.lower()
+    else:
+        fallback = find_contact_email(text)
+        if fallback:
+            result["contact_email"] = fallback
+
+    # line_items unit_price / quantity as ints
+    items = result.get("line_items")
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict):
+                if "unit_price" in item:
+                    v = parse_amount(item["unit_price"])
+                    if v is not None:
+                        item["unit_price"] = int(v)
+                if "quantity" in item and isinstance(item["quantity"], str):
+                    try:
+                        item["quantity"] = int(item["quantity"])
+                    except ValueError:
+                        pass
+        result["item_count"] = len(items)
+
+    # Trim/align to exact schema keys (no more, no less)
+    props = schema.get("properties", {})
+    if props:
+        aligned = {}
+        for key in props:
+            if key in result:
+                aligned[key] = result[key]
+        result = aligned
+
+    return result
 
 
 @app.post("/extract")
-def extract(req: ExtractRequest):
+async def extract(request: Request):
+    body = await request.json()
+    document_id = body.get("document_id")
+    text = body.get("text", "")
+    schema = body.get("schema", {})
 
-    text = req.invoice_text or ""
+    try:
+        raw_extracted = await call_llm(text, schema)
+    except Exception as e:
+        log.exception("LLM call failed for document %s", document_id)
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-    invoice_no = extract_invoice_no(text)
-
-    date = extract_date(text)
-
-    vendor = extract_vendor(text)
-
-    amount = extract_amount(text)
-
-    tax = extract_tax(text)
-
-    total = extract_total(text)
-
-    currency = extract_currency(text)
-
-    # -------------------------
-    # Hidden-test fallback
-    # -------------------------
-
-    if tax is None and amount is not None and total is not None:
-
-        if total >= amount:
-
-            tax = round(total - amount, 2)
-
-    return {
-        "invoice_no": invoice_no,
-        "date": date,
-        "vendor": vendor,
-        "amount": amount,
-        "tax": tax,
-        "currency": currency,
-    }
+    final = postprocess(raw_extracted, text, schema)
+    return JSONResponse(content=final)
 
 
 @app.get("/")
-def root():
-    return {
-        "status": "ok"
-    }
+async def health():
+    return {"status": "ok"}
