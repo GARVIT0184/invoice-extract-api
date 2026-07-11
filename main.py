@@ -260,14 +260,36 @@ Return ONLY the JSON object matching the schema exactly - no extra keys, no miss
         },
     }
 
+    import asyncio
+
+    max_attempts = 6
+    backoff = 2.0
+    last_error = None
+
     async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            GEMINI_URL,
-            params={"key": GEMINI_API_KEY},
-            json=payload,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        for attempt in range(max_attempts):
+            resp = await client.post(
+                GEMINI_URL,
+                params={"key": GEMINI_API_KEY},
+                json=payload,
+            )
+            if resp.status_code == 429 or resp.status_code >= 500:
+                last_error = f"{resp.status_code} {resp.text[:300]}"
+                if attempt < max_attempts - 1:
+                    # Respect Retry-After if Gemini sends one, else exponential backoff
+                    retry_after = resp.headers.get("retry-after")
+                    wait = float(retry_after) if retry_after else backoff
+                    log.warning("Gemini %s, retrying in %.1fs (attempt %d/%d)",
+                                resp.status_code, wait, attempt + 1, max_attempts)
+                    await asyncio.sleep(wait)
+                    backoff *= 2
+                    continue
+                resp.raise_for_status()
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        else:
+            raise ValueError(f"Gemini rate-limited after {max_attempts} attempts: {last_error}")
 
     try:
         text = data["candidates"][0]["content"]["parts"][0]["text"]
